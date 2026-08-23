@@ -11,9 +11,9 @@ use windows::{
             IO::DeviceIoControl,
             Services::{
                 CloseServiceHandle, CreateServiceW, OpenSCManagerW, OpenServiceW,
-                QueryServiceStatus, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
-                SERVICE_KERNEL_DRIVER, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STOPPED,
-                SERVICE_STATUS, ControlService, DeleteService, StartServiceW,
+                QueryServiceStatus, SERVICE_DEMAND_START,
+                SERVICE_KERNEL_DRIVER, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+                SERVICE_STATUS, StartServiceW,
                 SC_MANAGER_ALL_ACCESS,
             },
         },
@@ -38,12 +38,24 @@ struct WriteIoPortInput {
     value: u8,
 }
 
+/// Port-I/O backend. PawnIO is preferred: modern, signed, HVCI-compatible, and its
+/// modules are sandboxed to the ports they discovered. WinRing0 is the legacy
+/// fallback for machines without PawnIO installed.
 pub struct Ring0 {
+    backend: Backend,
+}
+
+enum Backend {
+    PawnIo(crate::pawnio::PawnIo),
+    WinRing0(WinRing0),
+}
+
+struct WinRing0 {
     handle: SendHandle,
 }
 
-/// HANDLE wrapper that is Send+Sync (WinRing0 handle is used from one thread at a
-/// time via the global OnceLock; DeviceIoControl on it is internally synchronized
+/// HANDLE wrapper that is Send+Sync (the WinRing0 handle is used from one thread at
+/// a time via the global OnceLock; DeviceIoControl on it is internally synchronized
 /// by the kernel).
 #[derive(Clone, Copy)]
 struct SendHandle(HANDLE);
@@ -51,12 +63,61 @@ unsafe impl Send for SendHandle {}
 unsafe impl Sync for SendHandle {}
 
 static RING0: OnceLock<Result<Ring0, String>> = OnceLock::new();
+/// Why PawnIO was not used, when we fell back. Reported by `--check`.
+static PAWNIO_ERROR: OnceLock<String> = OnceLock::new();
 
 pub fn get() -> Result<&'static Ring0, String> {
-    let r = RING0.get_or_init(|| Ring0::new());
+    let r = RING0.get_or_init(|| match crate::pawnio::PawnIo::open() {
+        Ok(p) => Ok(Ring0 { backend: Backend::PawnIo(p) }),
+        Err(e) => {
+            let _ = PAWNIO_ERROR.set(e);
+            WinRing0::new().map(|w| Ring0 { backend: Backend::WinRing0(w) })
+        }
+    });
     match r {
         Ok(r) => Ok(r),
         Err(e) => Err(e.clone()),
+    }
+}
+
+/// Name of the active backend, for the UI status line. Call after `get()`.
+pub fn backend_name() -> &'static str {
+    match RING0.get() {
+        Some(Ok(Ring0 { backend: Backend::PawnIo(_) })) => "PawnIO",
+        Some(Ok(Ring0 { backend: Backend::WinRing0(_) })) => "WinRing0",
+        _ => "none",
+    }
+}
+
+/// Set when PawnIO was unavailable and we fell back to WinRing0.
+pub fn pawnio_error() -> Option<&'static String> {
+    PAWNIO_ERROR.get()
+}
+
+impl Ring0 {
+    pub fn read_port_byte(&self, port: u16) -> u8 {
+        match &self.backend {
+            Backend::PawnIo(p) => p.read_port_byte(port),
+            Backend::WinRing0(w) => w.read_port_byte(port),
+        }
+    }
+
+    pub fn write_port_byte(&self, port: u16, value: u8) {
+        match &self.backend {
+            Backend::PawnIo(p) => p.write_port_byte(port, value),
+            Backend::WinRing0(w) => w.write_port_byte(port, value),
+        }
+    }
+
+    /// Backend version string; also a liveness check on the handle.
+    pub fn version_string(&self) -> String {
+        match &self.backend {
+            Backend::PawnIo(p) => p.version_string(),
+            Backend::WinRing0(w) => w
+                .driver_version()
+                .map(|v| format!("{v:#010X}"))
+                .unwrap_or_else(|| "unknown".into()),
+        }
     }
 }
 
@@ -64,8 +125,8 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-impl Ring0 {
-    fn new() -> Result<Ring0, String> {
+impl WinRing0 {
+    fn new() -> Result<WinRing0, String> {
         unsafe {
             Self::install_driver()?;
 
@@ -81,7 +142,7 @@ impl Ring0 {
             )
             .map_err(|e| format!("CreateFile({DRIVER_DEVICE}) failed: {e}"))?;
 
-            Ok(Ring0 { handle: SendHandle(handle) })
+            Ok(WinRing0 { handle: SendHandle(handle) })
         }
     }
 
@@ -137,30 +198,7 @@ impl Ring0 {
         }
     }
 
-    pub fn uninstall_driver() {
-        unsafe {
-            let Ok(scm) = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS) else { return };
-            let svc_name = wide(DRIVER_SERVICE);
-            let Ok(service) =
-                OpenServiceW(scm, PCWSTR(svc_name.as_ptr()), SERVICE_QUERY_STATUS | 0x0020 | 0x10000)
-            else {
-                let _ = CloseServiceHandle(scm);
-                return;
-            };
-
-            let mut status = SERVICE_STATUS::default();
-            if QueryServiceStatus(service, &mut status).is_ok()
-                && status.dwCurrentState != SERVICE_STOPPED
-            {
-                let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
-            }
-            let _ = DeleteService(service);
-            let _ = CloseServiceHandle(service);
-            let _ = CloseServiceHandle(scm);
-        }
-    }
-
-    pub fn read_port_byte(&self, port: u16) -> u8 {
+    fn read_port_byte(&self, port: u16) -> u8 {
         unsafe {
             let input = port as u32;
             let mut out: u32 = 0;
@@ -179,35 +217,7 @@ impl Ring0 {
         }
     }
 
-    /// Debug variant returning raw Result info
-    pub fn read_port_byte_dbg(&self, port: u16) -> (Option<u32>, String) {
-        unsafe {
-            let input = port as u32;
-            let mut out: u32 = 0;
-            let mut ret = 0u32;
-            match DeviceIoControl(
-                self.handle.0,
-                IOCTL_OLS_READ_IO_PORT_BYTE,
-                Some(&input as *const _ as *const _),
-                std::mem::size_of::<u32>() as u32,
-                Some(&mut out as *mut _ as *mut _),
-                std::mem::size_of::<u32>() as u32,
-                Some(&mut ret),
-                None,
-            ) {
-                Ok(_) => {
-                    if ret != 4 {
-                        (Some(out), format!("ok but bytesReturned={ret}"))
-                    } else {
-                        (Some(out), "ok".into())
-                    }
-                }
-                Err(e) => (None, format!("ERR {e}")),
-            }
-        }
-    }
-
-    pub fn write_port_byte(&self, port: u16, value: u8) {
+    fn write_port_byte(&self, port: u16, value: u8) {
         unsafe {
             let input = WriteIoPortInput {
                 port_number: port as u32,
@@ -228,7 +238,7 @@ impl Ring0 {
     }
 
     /// Driver version sanity check (validates the handle works).
-    pub fn driver_version(&self) -> Option<u32> {
+    fn driver_version(&self) -> Option<u32> {
         unsafe {
             let mut version: u32 = 0;
             let mut ret = 0u32;
@@ -247,7 +257,7 @@ impl Ring0 {
     }
 }
 
-impl Drop for Ring0 {
+impl Drop for WinRing0 {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.handle.0);
@@ -276,5 +286,3 @@ fn find_sys_file() -> Result<std::path::PathBuf, String> {
         candidates
     ))
 }
-
-

@@ -2,6 +2,7 @@
 
 mod config;
 mod nct6798d;
+mod pawnio;
 mod ring0;
 mod sensors;
 mod services;
@@ -39,22 +40,34 @@ fn check() {
     println!("== asus-control self test ==");
     let r0 = match ring0::get() {
         Ok(r) => {
-            let v = r.driver_version().map(|v| v.to_string()).unwrap_or_default();
-            println!("[OK] WinRing0 driver loaded (version {v})");
+            println!(
+                "[OK] {} backend loaded (version {})",
+                ring0::backend_name(),
+                r.version_string()
+            );
             r
         }
         Err(e) => {
             println!("[FAIL] driver: {e}");
+            if let Some(p) = ring0::pawnio_error() {
+                println!("       PawnIO: {p}");
+            }
             return;
         }
     };
+    if let Some(p) = ring0::pawnio_error() {
+        println!("[..] PawnIO unavailable, fell back to WinRing0: {p}");
+    }
 
-    // RTC validation
-    r0.write_port_byte(0x70, 0x08);
-    let m = r0.read_port_byte(0x71);
-    r0.write_port_byte(0x70, 0x09);
-    let y = r0.read_port_byte(0x71);
-    println!("[IO] RTC month/year = {m:#04X}/{y:#04X} (expect 0x08/0x26)");
+    // RTC validation. PawnIO confines us to the LpcIO module's discovered BARs, and
+    // the RTC pair is not one of them, so this probe only means anything on WinRing0.
+    if ring0::backend_name() == "WinRing0" {
+        r0.write_port_byte(0x70, 0x08);
+        let m = r0.read_port_byte(0x71);
+        r0.write_port_byte(0x70, 0x09);
+        let y = r0.read_port_byte(0x71);
+        println!("[IO] RTC month/year = {m:#04X}/{y:#04X} (expect 0x08/0x26)");
+    }
 
     let Some(mut nct) = nct6798d::Nct6798d::detect() else {
         println!("[FAIL] NCT6798D not found");

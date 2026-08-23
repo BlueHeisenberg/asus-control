@@ -9,6 +9,40 @@ pub struct FanConfig {
     pub points: Vec<(f32, f32)>, // (temp °C, duty %)
 }
 
+/// Global show/hide hotkey. `mods` is a MOD_* bitmask (ALT 1, CTRL 2,
+/// SHIFT 4, WIN 8), `vk` a virtual-key code. Default Ctrl+Shift+F12:
+/// plain Shift+F12 is already claimed on a lot of machines, and a hotkey
+/// that silently fails to register is worse than one extra modifier.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Hotkey {
+    pub mods: u32,
+    pub vk: u32,
+}
+
+impl Default for Hotkey {
+    fn default() -> Self {
+        Hotkey { mods: 2 | 4, vk: 0x7B } // MOD_CONTROL | MOD_SHIFT + VK_F12
+    }
+}
+
+impl Hotkey {
+    /// Human-readable form for the status line, e.g. "Shift+F12".
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        for (bit, name) in [(1, "Alt"), (2, "Ctrl"), (4, "Shift"), (8, "Win")] {
+            if self.mods & bit != 0 {
+                s.push_str(name);
+                s.push('+');
+            }
+        }
+        match self.vk {
+            0x70..=0x87 => s.push_str(&format!("F{}", self.vk - 0x6F)),
+            v => s.push_str(&format!("VK 0x{v:02X}")),
+        }
+        s
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub fans: Vec<FanConfig>,
@@ -18,6 +52,8 @@ pub struct Config {
     /// so it lives in the config file rather than in memory.
     #[serde(default)]
     pub asus_backup: Vec<(String, u32)>,
+    #[serde(default)]
+    pub hotkey: Hotkey,
 }
 
 impl Default for Config {
@@ -26,6 +62,7 @@ impl Default for Config {
             fans: default_fans(),
             tick_ms: 500,
             asus_backup: Vec::new(),
+            hotkey: Hotkey::default(),
         }
     }
 }
@@ -85,9 +122,27 @@ pub fn save(fans: &[FanConfig], tick_ms: u32, asus_backup: &[(String, u32)]) {
         fans: fans.to_vec(),
         tick_ms,
         asus_backup: asus_backup.to_vec(),
+        // nothing in the running app edits the hotkey, so keep whatever the
+        // user hand-edited into the file instead of stamping the default back
+        hotkey: load().hotkey,
     };
     if let Ok(json) = serde_json::to_string_pretty(&cfg) {
         let _ = std::fs::write(config_path(), json);
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hotkey_default_is_shift_f12() {
+        assert_eq!(Hotkey::default().label(), "Shift+F12");
+        assert_eq!(Hotkey { mods: 2 | 4, vk: 0x70 }.label(), "Ctrl+Shift+F1");
+        // existing configs without the field must still load
+        let c: Config = serde_json::from_str(r#"{"fans":[],"tick_ms":500}"#).unwrap();
+        assert_eq!(c.hotkey.vk, 0x7B);
+        assert_eq!(c.hotkey.mods, 6);
+    }
+}

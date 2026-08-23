@@ -1,4 +1,4 @@
-use crate::config::FAN_NAMES;
+use crate::config::{self, FAN_NAMES};
 use crate::worker::Shared;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,7 +15,14 @@ use windows::{
         UI::{
             Controls::*,
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE},
+            Input::KeyboardAndMouse::{
+                RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey,
+                HOT_KEY_MODIFIERS, TRACKMOUSEEVENT, TME_LEAVE,
+            },
+            Shell::{
+                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -30,6 +37,13 @@ const ID_PRESET_FULL: isize = 213;
 const ID_RELEASE_ALL: isize = 214;
 const ID_ASUS_SVC: isize = 215;
 const ID_TICK: isize = 220;
+
+// tray
+const WM_TRAY: u32 = WM_APP + 1;
+const TRAY_UID: u32 = 1;
+const IDM_TRAY_TOGGLE: usize = 1;
+const IDM_TRAY_EXIT: usize = 2;
+const HOTKEY_ID: i32 = 1;
 
 const TEMP_MIN: f32 = 20.0;
 const TEMP_MAX: f32 = 110.0;
@@ -96,6 +110,15 @@ struct Ui {
     brush_bg: HBRUSH,
     last_sig: u64,
     asus_state: bool,
+    /// RegisterWindowMessageW("TaskbarCreated") — Explorer restarts send it
+    taskbar_created: u32,
+    /// set when RegisterHotKey lost the combo to another app
+    hotkey_err: Option<String>,
+    /// the combo we actually hold, once fallbacks are resolved
+    hotkey_active: Option<config::Hotkey>,
+    /// Shell_NotifyIconW is a synchronous send to Explorer — only issue one
+    /// when the text really changed, not on every tick
+    last_tip: String,
 }
 
 impl Ui {
@@ -175,6 +198,10 @@ pub fn run(shared: Arc<Shared>) {
             brush_bg: CreateSolidBrush(rgb(col::BG)),
             last_sig: 0,
             asus_state: false,
+            taskbar_created: RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr())),
+            hotkey_err: None,
+            hotkey_active: None,
+            last_tip: String::new(),
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ui) as _);
         make_fonts(get_ui(hwnd));
@@ -205,7 +232,39 @@ pub fn run(shared: Arc<Shared>) {
         let _ = SetWindowTheme(track, PCWSTR(wide("DarkMode_Explorer").as_ptr()), PCWSTR(wide("").as_ptr()));
 
         relayout(hwnd);
+
+        // Try the configured combo, then a couple of fallbacks. Shift+F12 is a
+        // popular default and is genuinely taken on some machines; silently
+        // having no hotkey at all is worse than using a neighbouring one.
+        let want = config::load().hotkey;
+        let fallbacks = [
+            want,
+            config::Hotkey { mods: 0x0008, vk: want.vk },          // Win+<key>
+            config::Hotkey { mods: 0x0002 | 0x0004, vk: 0x7A },    // Ctrl+Shift+F11
+            config::Hotkey { mods: 0x0004, vk: 0x7A },             // Shift+F11
+        ];
+        let mut active = None;
+        for cand in fallbacks {
+            if RegisterHotKey(hwnd, HOTKEY_ID, HOT_KEY_MODIFIERS(cand.mods), cand.vk).is_ok() {
+                active = Some(cand);
+                break;
+            }
+        }
+        {
+            let ui = get_ui(hwnd);
+            ui.hotkey_active = active;
+            ui.hotkey_err = match active {
+                Some(a) if a.mods == want.mods && a.vk == want.vk => None,
+                Some(a) => Some(format!("{} taken, using {}", want.label(), a.label())),
+                None => Some(format!("hotkey {} unavailable", want.label())),
+            };
+        }
+        tray(hwnd, NIM_ADD);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Dock AFTER showing: before the first show the frame has not settled to
+        // its final size, so GetWindowRect returns a stale extent and the window
+        // lands short of the corner.
+        dock_bottom_right(hwnd);
         SetTimer(hwnd, 1, tick, None);
 
         let mut msg = MSG::default();
@@ -345,11 +404,143 @@ fn relayout(hwnd: HWND) {
     }
 }
 
+// ---------------- tray / hotkey / docking -----------------------------------
+
+/// One entry point for NIM_ADD / NIM_MODIFY / NIM_DELETE so the icon, callback
+/// message and tooltip can never be described two different ways.
+unsafe fn tray(hwnd: HWND, op: NOTIFY_ICON_MESSAGE) {
+    let mut n = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        ..Default::default()
+    };
+    if op != NIM_DELETE {
+        n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        n.uCallbackMessage = WM_TRAY;
+        // no icon resource is compiled in, so borrow the shell's default
+        n.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        let tip = tray_tip(get_ui(hwnd));
+        for (dst, src) in n.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
+            *dst = src;
+        }
+    }
+    let _ = Shell_NotifyIconW(op, &n);
+}
+
+fn tray_tip(ui: &Ui) -> String {
+    let d = ui.shared.data.lock().unwrap();
+    let t = Shared::control_temp(&d)
+        .map(|t| format!("{t:.0} °C"))
+        .unwrap_or_else(|| "—".into());
+    let rpm = d
+        .rpm
+        .get(ui.selected)
+        .copied()
+        .flatten()
+        .map(|r| format!("{r:.0} rpm"))
+        .unwrap_or_else(|| "—".into());
+    format!("asus-control\nCPU {t}  ·  {} {rpm}", FAN_NAMES[ui.selected])
+}
+
+unsafe fn tray_menu(hwnd: HWND) {
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let Some(menu) = CreatePopupMenu().ok() else { return };
+    let visible = IsWindowVisible(hwnd).as_bool();
+    let _ = AppendMenuW(menu, MF_STRING, IDM_TRAY_TOGGLE, PCWSTR(wide(if visible { "Hide" } else { "Show" }).as_ptr()));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, PCWSTR(wide("Exit").as_ptr()));
+    // the two classic tray-menu fixes: foreground first, dummy message after,
+    // or the menu sticks around after you click elsewhere
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, None);
+    let _ = DestroyMenu(menu);
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    match cmd.0 as usize {
+        IDM_TRAY_TOGGLE => toggle_window(hwnd),
+        IDM_TRAY_EXIT => {
+            let _ = DestroyWindow(hwnd);
+        }
+        _ => {}
+    }
+}
+
+unsafe fn toggle_window(hwnd: HWND) {
+    if IsWindowVisible(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    } else {
+        // Dock twice on purpose. The first call gets it onto the right monitor
+        // so it doesn't flash at the old position; but moving across monitors
+        // of different scaling triggers WM_DPICHANGED, which RESIZES the window
+        // after we placed it — computing the corner from the pre-resize extent
+        // leaves it hanging off the edge. The second call runs once the size
+        // has settled and is what actually lands it in the corner.
+        dock_bottom_right(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        dock_bottom_right(hwnd);
+    }
+}
+
+/// Bottom-right of the work area of whichever monitor the cursor is on, so
+/// it sits above the taskbar and lands on the right screen in a multi-mon setup.
+unsafe fn dock_bottom_right(hwnd: HWND) {
+    let ui = get_ui(hwnd);
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let mut work = RECT::default();
+    if GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+        work = mi.rcWork;
+    } else {
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    let mut r = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut r);
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let m = ui.s(8);
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        (work.right - w - m).max(work.left),
+        (work.bottom - h - m).max(work.top),
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 0 {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    // Explorer restarted and wiped the notification area — put the icon back
+    if msg != 0 && msg == get_ui(hwnd).taskbar_created {
+        tray(hwnd, NIM_ADD);
+        return LRESULT(0);
+    }
     match msg {
+        WM_TRAY => match (lp.0 as u32) & 0xFFFF {
+            WM_LBUTTONUP => toggle_window(hwnd),
+            WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(hwnd),
+            _ => {}
+        },
+        WM_HOTKEY => toggle_window(hwnd),
+        // the X hides to tray; only the tray menu's Exit really quits, because
+        // the process owns the fans for as long as it runs
+        WM_CLOSE => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            return LRESULT(0);
+        }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => paint(hwnd),
         WM_SIZE => relayout(hwnd),
@@ -370,6 +561,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = SetWindowPos(hwnd, None, (*r).left, (*r).top, (*r).right - (*r).left, (*r).bottom - (*r).top, SWP_NOZORDER);
             }
             relayout(hwnd);
+            if IsWindowVisible(hwnd).as_bool() {
+                dock_bottom_right(hwnd);
+            }
             return LRESULT(0);
         }
         WM_CTLCOLORBTN | WM_CTLCOLORSTATIC => {
@@ -394,6 +588,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(b) = dlg(hwnd, ID_ASUS_SVC) {
                     let _ = InvalidateRect(b, None, false);
                 }
+            }
+            let tip = tray_tip(ui);
+            if tip != ui.last_tip {
+                ui.last_tip = tip;
+                tray(hwnd, NIM_MODIFY); // live tooltip, no second timer
             }
             let sig = data_signature(ui);
             if sig != ui.last_sig {
@@ -449,6 +648,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DESTROY => {
             let ui = get_ui(hwnd);
             ui.shared.persist();
+            tray(hwnd, NIM_DELETE);
+            let _ = UnregisterHotKey(hwnd, HOTKEY_ID);
             PostQuitMessage(0);
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
@@ -860,8 +1061,11 @@ fn draw_text(ui: &Ui, hdc: HDC, _rc: &RECT) {
         // ---- header: name + live status ----
         let h = l.header;
         txt(hdc, "asus-control", RECT { left: h.left, top: h.top, right: h.left + s(200), bottom: h.bottom }, DT_VCENTER, ui.font_bold, col::TEXT);
-        let st = ui.shared.status.lock().unwrap().clone();
+        let mut st = ui.shared.status.lock().unwrap().clone();
         let ok = ui.shared.hw_ok.load(Ordering::Relaxed);
+        if let Some(e) = &ui.hotkey_err {
+            st = format!("{} · {e}", st.trim_end_matches([' ', '·']));
+        }
         txt(
             hdc,
             st.trim_end_matches([' ', '·']),
@@ -1025,13 +1229,13 @@ unsafe fn draw_owner_button(dis: &DRAWITEMSTRUCT, ui: &Ui) {
     let mem = CreateCompatibleDC(dis.hDC);
     let bmp = CreateCompatibleBitmap(dis.hDC, w, h);
     let old = SelectObject(mem, HGDIOBJ(bmp.0));
-    SetViewportOrgEx(mem, -rc.left, -rc.top, None);
+    let _ = SetViewportOrgEx(mem, -rc.left, -rc.top, None);
 
     let mut d = *dis;
     d.hDC = mem;
     draw_owner_button_inner(&d, ui);
 
-    SetViewportOrgEx(mem, 0, 0, None);
+    let _ = SetViewportOrgEx(mem, 0, 0, None);
     let _ = BitBlt(dis.hDC, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
     let _ = DeleteObject(HGDIOBJ(bmp.0));

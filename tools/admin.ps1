@@ -14,6 +14,10 @@
 param(
   [Parameter(ParameterSetName = 'Run', Position = 0, ValueFromRemainingArguments = $true)]
   [string[]]$Command,
+  # Run a whole .ps1 verbatim. Use this for anything with quotes, newlines or
+  # here-strings: -Command goes through PowerShell's argument splitter, which
+  # strips quoting and mangles embedded C#/JSON.
+  [Parameter(ParameterSetName = 'Script', Mandatory = $true)][string]$Script,
   [Parameter(ParameterSetName = 'Start')][switch]$Start,
   [Parameter(ParameterSetName = 'Stop')][switch]$Stop,
   [Parameter(ParameterSetName = 'Status')][switch]$Status,
@@ -111,9 +115,16 @@ if ($Start) {
 
 # --- default: run a command -------------------------------------------------
 
-if (-not $Command) { Get-Help $PSCommandPath -Detailed; exit 0 }
+if ($Script) {
+  if (-not (Test-Path $Script)) { Write-Host "no such script: $Script" -ForegroundColor Red; exit 1 }
+  $payload = Get-Content -Raw -Path $Script
+} elseif ($Command) {
+  $payload = $Command -join ' '
+} else {
+  Get-Help $PSCommandPath -Detailed; exit 0
+}
 
-$r = Invoke-Remote ($Command -join ' ')
+$r = Invoke-Remote $payload
 if (-not $r) {
   Write-Host "elevated shell not running. start it with:`n  .\tools\admin.ps1 -Start" -ForegroundColor Yellow
   exit 1
