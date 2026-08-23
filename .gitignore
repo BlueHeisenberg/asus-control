@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# .NET bridge — build output embeds local NuGet paths (i.e. your username)
+bridge/bin/
+bridge/obj/
+bridge/publish/
+
+# built artifacts: this repo ships source, not binaries
+/deploy/*.exe
+*.pdb
+
+# WinRing0 kernel driver: not redistributed here — see README.
+# It is a signed port-I/O driver and a known BYOVD/LPE vector; fetch it
+# yourself from a LibreHardwareMonitor release.
+*.sys
+
+# local sensor dumps — full machine inventory (adapters, VPN/endpoint filters)
+bridge/smoke*.txt
