@@ -264,12 +264,7 @@ pub fn run(shared: Arc<Shared>) {
             };
         }
         tray(hwnd, NIM_ADD);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = UpdateWindow(hwnd);
-        // Dock AFTER showing: before the first show the frame has not settled to
-        // its final size, so GetWindowRect returns a stale extent and the window
-        // lands short of the corner.
-        dock_bottom_right(hwnd);
+        show_without_flash(hwnd);
         SetTimer(hwnd, 1, tick, None);
 
         let mut msg = MSG::default();
@@ -471,6 +466,28 @@ unsafe fn tray_menu(hwnd: HWND) {
     }
 }
 
+/// Show the window without the blank first frame.
+///
+/// A hidden window has no painted surface, and hidden windows never receive
+/// WM_PAINT — so SW_SHOW composites one empty (white) frame before any of our
+/// drawing runs. Erasing the background dark fixes the case where that frame
+/// is merely late, but not this one: the surface is presented before
+/// WM_ERASEBKGND happens at all. So park it off-screen, show it there, paint it
+/// fully, and only then move it into place. Nobody sees the blank frame.
+unsafe fn show_without_flash(hwnd: HWND) {
+    let mut r = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut r);
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let _ = SetWindowPos(hwnd, None, -32000, -32000, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_ALLCHILDREN);
+    // now it is fully drawn: place it, twice, because crossing monitors of
+    // different scaling resizes it after the move (see dock_bottom_right)
+    dock_bottom_right(hwnd);
+    dock_bottom_right(hwnd);
+    let _ = SetForegroundWindow(hwnd);
+}
+
 unsafe fn toggle_window(hwnd: HWND) {
     if IsWindowVisible(hwnd).as_bool() {
         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -481,13 +498,7 @@ unsafe fn toggle_window(hwnd: HWND) {
         // after we placed it — computing the corner from the pre-resize extent
         // leaves it hanging off the edge. The second call runs once the size
         // has settled and is what actually lands it in the corner.
-        dock_bottom_right(hwnd);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        dock_bottom_right(hwnd);
-        // force the first frame now; without it the window is composited once
-        // before WM_PAINT ever runs
-        let _ = UpdateWindow(hwnd);
-        let _ = SetForegroundWindow(hwnd);
+        show_without_flash(hwnd);
     }
 }
 
