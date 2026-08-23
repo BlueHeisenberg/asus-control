@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: dotnet publish bridge
+        run: dotnet publish bridge -c Release -r win-x64 --self-contained false -o dist/asus-control/bridge/publish
+
+      - name: Stage and zip
+        run: |
+          Copy-Item target/release/asus-control.exe dist/asus-control/
+          Copy-Item README.md dist/asus-control/
+          Compress-Archive -Path dist/asus-control/* -DestinationPath "dist/asus-control-$env:GITHUB_REF_NAME-win-x64.zip"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTE: |
+            ### Install
+            Unzip anywhere and run `asus-control.exe` as administrator. The sensor
+            bridge is in `bridge/publish/` next to it — keep the layout intact.
+            .NET 9 desktop runtime required (framework-dependent build).
+
+            ### Driver not included
+            `WinRing0x64.sys` is **deliberately not shipped** here: it is a
+            signed-but-blocklisted port-I/O driver and a known BYOVD/LPE vector.
+            Supply it yourself from a LibreHardwareMonitor release and drop it
+            next to `asus-control.exe`, or — preferred — install
+            [PawnIO](https://pawnio.eu/) and let LibreHardwareMonitor use that
+            instead. See the README for details.
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/asus-control-$GITHUB_REF_NAME-win-x64.zip" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "$NOTE"

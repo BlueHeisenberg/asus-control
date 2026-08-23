@@ -136,7 +136,6 @@ fn find_bridge_exe() -> Result<std::path::PathBuf, String> {
         dir.parent()
             .map(|d| d.join("bridge").join("publish").join("bridge.exe"))
             .unwrap_or_default(),
-
     ];
     for c in &candidates {
         if c.exists() {
