@@ -25,13 +25,44 @@ Borderless and tray-resident — there is no title bar and no min/max/close.
   only thing that really quits** — closing hides to tray, because the process
   owns your fans for as long as it runs.
 - **Esc** hides it.
+- **Always on top** and **Start with Windows** are toggles in the footer, both
+  **on by default**. Turning either off is remembered and is not forced back on.
 - **Drag it from anywhere that isn't the curve editor** — the header, the
   sensor list, the empty footer. Where you drop it is remembered in
   `window_pos` and reused every time it opens. Delete that key (or move the
   window to a monitor you later unplug) and it goes back to docking itself
   bottom-right of whichever monitor the cursor is on.
 
+### Autostart and multi-user
+
+"Start with Windows" registers a **machine-wide scheduled task**, not a
+`HKCU\...\Run` entry. The app needs administrator to load its driver, and a Run
+entry for an elevated exe means a UAC prompt at every single logon. The task is
+registered with `RunLevel=HighestAvailable` and a logon trigger with no UserId,
+whose principal is `BUILTIN\Users` (S-1-5-32-545) — so it starts for whoever
+logs on, elevated, without prompting. Admin accounts get the elevated start; a
+standard user gets a launch that cannot load the driver.
+
+### Where state is kept
+
+| What | Where | Scope |
+|---|---|---|
+| Fan curves, per-fan enable, poll rate, hotkey, window position, always-on-top, saved ASUS service start types | `%APPDATA%\asus-control\config.json` | per user |
+| Autostart | scheduled task named `asus-control` | per machine |
+| "autostart was deliberately turned off" | `%ProgramData%\asus-control\autostart-optout` | per machine |
+| Port-I/O driver service | `WinRing0_1_2_0` service (or PawnIO, if installed) | per machine |
+
+Changing your curves does not change anyone else's — only the task and the
+opt-out marker are shared, because autostart is a decision about the PC.
+
+One caveat worth knowing: fans are global hardware. If two users are signed in
+at once via fast user switching, both instances drive the same PWM registers
+from their own curves and fight. The task uses
+`MultipleInstancesPolicy=IgnoreNew`, which covers the autostart path, but
+nothing stops a second user launching it by hand.
+
 ## Run
+
 
 Requires administrator (driver load). Launch `deploy/asus-control.exe` and accept UAC.
 
