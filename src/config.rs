@@ -58,6 +58,10 @@ pub struct Config {
     /// None = fall back to docking bottom-right of the cursor's monitor.
     #[serde(default)]
     pub window_pos: Option<(i32, i32)>,
+    /// keep the window above every other window. On by default; a user who
+    /// turns it off has that written to their own config and kept.
+    #[serde(default = "yes")]
+    pub always_on_top: bool,
 }
 
 impl Default for Config {
@@ -68,8 +72,13 @@ impl Default for Config {
             asus_backup: Vec::new(),
             hotkey: Hotkey::default(),
             window_pos: None,
+            always_on_top: true,
         }
     }
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub fn default_fans() -> Vec<FanConfig> {
@@ -127,12 +136,14 @@ pub fn save(
     tick_ms: u32,
     asus_backup: &[(String, u32)],
     window_pos: Option<(i32, i32)>,
+    always_on_top: bool,
 ) {
     let cfg = Config {
         fans: fans.to_vec(),
         tick_ms,
         asus_backup: asus_backup.to_vec(),
         window_pos,
+        always_on_top,
         // nothing in the running app edits the hotkey, so keep whatever the
         // user hand-edited into the file instead of stamping the default back
         hotkey: load().hotkey,

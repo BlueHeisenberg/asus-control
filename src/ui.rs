@@ -36,6 +36,8 @@ const ID_PRESET_QUIET: isize = 212;
 const ID_PRESET_FULL: isize = 213;
 const ID_RELEASE_ALL: isize = 214;
 const ID_ASUS_SVC: isize = 215;
+const ID_PIN: isize = 216;
+const ID_AUTOSTART: isize = 217;
 const ID_TICK: isize = 220;
 
 // tray
@@ -116,6 +118,9 @@ struct Ui {
     hotkey_err: Option<String>,
     /// the combo we actually hold, once fallbacks are resolved
     hotkey_active: Option<config::Hotkey>,
+    /// machine-wide autostart state; refreshed only on startup and on toggle,
+    /// because reading it spawns schtasks
+    autostart_on: bool,
     /// Shell_NotifyIconW is a synchronous send to Explorer — only issue one
     /// when the text really changed, not on every tick
     last_tip: String,
@@ -207,6 +212,7 @@ pub fn run(shared: Arc<Shared>) {
             taskbar_created: RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr())),
             hotkey_err: None,
             hotkey_active: None,
+            autostart_on: false,
             last_tip: String::new(),
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ui) as _);
@@ -230,6 +236,8 @@ pub fn run(shared: Arc<Shared>) {
         create_child(hwnd, hinstance, "BUTTON", "Full Speed", BS_OWNERDRAW as u32, ID_PRESET_FULL);
         create_child(hwnd, hinstance, "BUTTON", "Release all fans", BS_OWNERDRAW as u32, ID_RELEASE_ALL);
         create_child(hwnd, hinstance, "BUTTON", "", BS_OWNERDRAW as u32, ID_ASUS_SVC);
+        create_child(hwnd, hinstance, "BUTTON", "", BS_OWNERDRAW as u32, ID_PIN);
+        create_child(hwnd, hinstance, "BUTTON", "", BS_OWNERDRAW as u32, ID_AUTOSTART);
 
         let track = create_child(hwnd, hinstance, "msctls_trackbar32", "", TBS_HORZ | TBS_NOTICKS, ID_TICK);
         SendMessageW(track, TBM_SETRANGE, WPARAM(1), LPARAM((((2000u32) << 16) | 100u32) as i32 as isize));
@@ -265,6 +273,7 @@ pub fn run(shared: Arc<Shared>) {
                 None => Some(format!("hotkey {} unavailable", want.label())),
             };
         }
+        get_ui(hwnd).autostart_on = crate::autostart::is_enabled();
         tray(hwnd, NIM_ADD);
         show_without_flash(hwnd);
         SetTimer(hwnd, 1, tick, None);
@@ -398,8 +407,10 @@ fn relayout(hwnd: HWND) {
         // footer
         let fh = s(32);
         let fy = l.footer.top + (l.footer.bottom - l.footer.top - fh) / 2;
-        mv(ID_RELEASE_ALL, l.footer.left, fy, s(180), fh);
-        mv(ID_ASUS_SVC, l.footer.left + s(188), fy, s(220), fh);
+        mv(ID_RELEASE_ALL, l.footer.left, fy, s(150), fh);
+        mv(ID_ASUS_SVC, l.footer.left + s(158), fy, s(196), fh);
+        mv(ID_PIN, l.footer.left + s(362), fy, s(150), fh);
+        mv(ID_AUTOSTART, l.footer.left + s(520), fy, s(170), fh);
         mv(ID_TICK, l.footer.right - s(210), fy, s(210), fh);
 
         let _ = InvalidateRect(hwnd, None, false);
@@ -495,6 +506,8 @@ unsafe fn show_without_flash(hwnd: HWND) {
     let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_ALLCHILDREN);
 
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &off as *const _ as *const _, 4);
+    // a show can drop us out of the topmost band, so re-assert it every time
+    apply_topmost(hwnd);
     let _ = SetForegroundWindow(hwnd);
 }
 
@@ -514,6 +527,14 @@ unsafe fn toggle_window(hwnd: HWND) {
 
 /// Bottom-right of the work area of whichever monitor the cursor is on, so
 /// it sits above the taskbar and lands on the right screen in a multi-mon setup.
+/// Push the window into the topmost z-order band, or back out of it.
+unsafe fn apply_topmost(hwnd: HWND) {
+    let ui = get_ui(hwnd);
+    let on = ui.shared.always_on_top.load(Ordering::Relaxed);
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let _ = SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
 /// Where the window should appear: the position the user dragged it to, if that
 /// is still on a monitor that exists, otherwise docked bottom-right.
 unsafe fn place_window(hwnd: HWND) {
@@ -635,7 +656,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let ui = get_ui(hwnd);
             let mmi = lp.0 as *mut MINMAXINFO;
             if !mmi.is_null() {
-                (*mmi).ptMinTrackSize = POINT { x: ui.s(1000), y: ui.s(640) };
+                (*mmi).ptMinTrackSize = POINT { x: ui.s(1120), y: ui.s(640) };
             }
             return LRESULT(0);
         }
@@ -778,6 +799,35 @@ fn handle_command(hwnd: HWND, wp: WPARAM) {
             ID_PRESET_QUIET => set_preset(ui, vec![(30., 15.), (60., 25.), (75., 45.), (90., 85.)]),
             ID_PRESET_FULL => set_preset(ui, vec![(20., 100.), (110., 100.)]),
             ID_RELEASE_ALL => ui.shared.release_all.store(true, Ordering::Relaxed),
+            ID_AUTOSTART => {
+                let want = !ui.autostart_on;
+                // NB: GdiPlus exports a constant named `Ok`, so `match` on a
+                // Result does not work in this module (see dlg() above).
+                let r = crate::autostart::set(want);
+                if r.is_ok() {
+                    ui.autostart_on = crate::autostart::is_enabled();
+                    *ui.shared.status.lock().unwrap() = if ui.autostart_on {
+                        "starts with Windows for every user on this PC".into()
+                    } else {
+                        "autostart removed".into()
+                    };
+                } else {
+                    *ui.shared.status.lock().unwrap() =
+                        format!("autostart failed: {}", r.unwrap_err());
+                }
+                if let Some(b) = dlg(hwnd, ID_AUTOSTART) {
+                    let _ = InvalidateRect(b, None, false);
+                }
+            }
+            ID_PIN => {
+                let on = !ui.shared.always_on_top.load(Ordering::Relaxed);
+                ui.shared.always_on_top.store(on, Ordering::Relaxed);
+                apply_topmost(hwnd);
+                ui.shared.persist();
+                if let Some(b) = dlg(hwnd, ID_PIN) {
+                    let _ = InvalidateRect(b, None, false);
+                }
+            }
             ID_ASUS_SVC => {
                 ui.shared.toggle_asus.store(true, Ordering::Relaxed);
                 *ui.shared.status.lock().unwrap() = "working on ASUS services…".into();
@@ -1386,8 +1436,18 @@ unsafe fn draw_owner_button_inner(dis: &DRAWITEMSTRUCT, ui: &Ui) {
     let selected_tab = is_tab && id == ID_FAN_BASE + ui.selected as isize;
     let controlled = is_tab && ui.shared.fans.lock().unwrap()[(id - ID_FAN_BASE) as usize].enabled;
 
+    let pinned = (id == ID_PIN && ui.shared.always_on_top.load(Ordering::Relaxed))
+        || (id == ID_AUTOSTART && ui.autostart_on);
     let asus_off = id == ID_ASUS_SVC && ui.shared.asus_disabled();
-    let (fill, border, fg) = if id == ID_ASUS_SVC {
+    let (fill, border, fg) = if id == ID_PIN || id == ID_AUTOSTART {
+        if pinned {
+            if hot { (0x1B4570, col::ACCENT, 0xDCEBFF) } else { (col::ACCENT_BG, col::ACCENT, 0xCFE6FF) }
+        } else if hot {
+            (0x232936, 0x39414F, col::TEXT)
+        } else {
+            (col::CARD_HI, col::BORDER, col::TEXT_2)
+        }
+    } else if id == ID_ASUS_SVC {
         if asus_off {
             if hot { (0x1B3E22, col::OK_BR, 0x9BEBA6) } else { (col::OK_BG, col::OK_BR, col::OK_FG) }
         } else if hot {
@@ -1421,7 +1481,11 @@ unsafe fn draw_owner_button_inner(dis: &DRAWITEMSTRUCT, ui: &Ui) {
     }
     drop(g);
 
-    let s: String = if id == ID_ASUS_SVC {
+    let s: String = if id == ID_PIN {
+        if pinned { "Always on top: ON".into() } else { "Always on top".into() }
+    } else if id == ID_AUTOSTART {
+        if pinned { "Autostart: ON".into() } else { "Start with Windows".into() }
+    } else if id == ID_ASUS_SVC {
         if asus_off { "Restore ASUS services".into() } else { "Disable ASUS services".into() }
     } else {
         let mut buf = [0u16; 64];

@@ -24,6 +24,7 @@ pub struct Shared {
     pub asus_backup: Mutex<Vec<(String, u32)>>,
     /// last position the user dragged the window to
     pub window_pos: Mutex<Option<(i32, i32)>>,
+    pub always_on_top: AtomicBool,
     pub restore_mask: AtomicU64,
     pub release_all: AtomicBool,
     pub tick_ms: AtomicU32,
@@ -36,7 +37,13 @@ impl Shared {
         let mut cfg = config::load();
         // Create the config file on first run so users can find/edit it
         if !config::exists() {
-            config::save(&cfg.fans, cfg.tick_ms, &cfg.asus_backup, cfg.window_pos);
+            config::save(
+                &cfg.fans,
+                cfg.tick_ms,
+                &cfg.asus_backup,
+                cfg.window_pos,
+                cfg.always_on_top,
+            );
         }
         let _ = &mut cfg;
         let tick = cfg.tick_ms;
@@ -46,6 +53,7 @@ impl Shared {
             toggle_asus: AtomicBool::new(false),
             asus_backup: Mutex::new(cfg.asus_backup),
             window_pos: Mutex::new(cfg.window_pos),
+            always_on_top: AtomicBool::new(cfg.always_on_top),
             restore_mask: AtomicU64::new(0),
             release_all: AtomicBool::new(false),
             tick_ms: AtomicU32::new(tick),
@@ -58,7 +66,13 @@ impl Shared {
         let fans = self.fans.lock().unwrap().clone();
         let backup = self.asus_backup.lock().unwrap().clone();
         let pos = *self.window_pos.lock().unwrap();
-        config::save(&fans, self.tick_ms.load(Ordering::Relaxed), &backup, pos);
+        config::save(
+            &fans,
+            self.tick_ms.load(Ordering::Relaxed),
+            &backup,
+            pos,
+            self.always_on_top.load(Ordering::Relaxed),
+        );
     }
 
     /// True when we currently hold ASUS services disabled.

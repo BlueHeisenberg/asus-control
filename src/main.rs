@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod config;
 mod nct6798d;
 mod pawnio;
@@ -27,6 +28,9 @@ fn main() {
         nct6798d::emergency_restore();
         prev(info);
     }));
+
+    // autostart is on unless somebody turned it off on this machine
+    autostart::ensure_default();
 
     let shared = worker::Shared::new();
     worker::spawn_worker(shared.clone());
