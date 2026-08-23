@@ -7,7 +7,7 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
-            Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
+            Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE},
             Gdi::*,
             GdiPlus::*,
         },
@@ -475,16 +475,24 @@ unsafe fn tray_menu(hwnd: HWND) {
 /// WM_ERASEBKGND happens at all. So park it off-screen, show it there, paint it
 /// fully, and only then move it into place. Nobody sees the blank frame.
 unsafe fn show_without_flash(hwnd: HWND) {
-    let mut r = RECT::default();
-    let _ = GetWindowRect(hwnd, &mut r);
-    let (w, h) = (r.right - r.left, r.bottom - r.top);
-    let _ = SetWindowPos(hwnd, None, -32000, -32000, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+    // Cloak BEFORE showing. A cloaked window is composited nowhere, yet it is
+    // shown as far as the system is concerned, so it receives WM_PAINT and can
+    // settle at its final position, size and DPI entirely off the screen.
+    //
+    // Showing it off-screen instead was not enough: moving it onto the target
+    // monitor can change the DPI, which resizes the window, and that resize
+    // happened while it was already visible — exposing unpainted area.
+    let on: i32 = 1;
+    let off: i32 = 0;
+    let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &on as *const _ as *const _, 4);
+
+    dock_bottom_right(hwnd);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    // now that it is "shown" its DPI is known; re-dock in case that resized it
+    dock_bottom_right(hwnd);
     let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_ALLCHILDREN);
-    // now it is fully drawn: place it, twice, because crossing monitors of
-    // different scaling resizes it after the move (see dock_bottom_right)
-    dock_bottom_right(hwnd);
-    dock_bottom_right(hwnd);
+
+    let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &off as *const _ as *const _, 4);
     let _ = SetForegroundWindow(hwnd);
 }
 
