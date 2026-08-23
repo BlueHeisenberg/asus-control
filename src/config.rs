@@ -54,6 +54,10 @@ pub struct Config {
     pub asus_backup: Vec<(String, u32)>,
     #[serde(default)]
     pub hotkey: Hotkey,
+    /// Where the user dragged the window to, in physical screen pixels.
+    /// None = fall back to docking bottom-right of the cursor's monitor.
+    #[serde(default)]
+    pub window_pos: Option<(i32, i32)>,
 }
 
 impl Default for Config {
@@ -63,6 +67,7 @@ impl Default for Config {
             tick_ms: 500,
             asus_backup: Vec::new(),
             hotkey: Hotkey::default(),
+            window_pos: None,
         }
     }
 }
@@ -117,11 +122,17 @@ pub fn exists() -> bool {
     config_path().exists()
 }
 
-pub fn save(fans: &[FanConfig], tick_ms: u32, asus_backup: &[(String, u32)]) {
+pub fn save(
+    fans: &[FanConfig],
+    tick_ms: u32,
+    asus_backup: &[(String, u32)],
+    window_pos: Option<(i32, i32)>,
+) {
     let cfg = Config {
         fans: fans.to_vec(),
         tick_ms,
         asus_backup: asus_backup.to_vec(),
+        window_pos,
         // nothing in the running app edits the hotkey, so keep whatever the
         // user hand-edited into the file instead of stamping the default back
         hotkey: load().hotkey,

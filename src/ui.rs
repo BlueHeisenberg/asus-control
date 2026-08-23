@@ -16,7 +16,7 @@ use windows::{
             Controls::*,
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{
-                RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey,
+                RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey, VK_ESCAPE,
                 HOT_KEY_MODIFIERS, TRACKMOUSEEVENT, TME_LEAVE,
             },
             Shell::{
@@ -166,7 +166,9 @@ pub fn run(shared: Arc<Shared>) {
             WINDOW_EX_STYLE(0),
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("asus-control").as_ptr()),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            // borderless: no caption, no frame, no min/max/close.
+            // The tray menu and Esc are how the window goes away.
+            WS_POPUP | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1220,
@@ -486,10 +488,10 @@ unsafe fn show_without_flash(hwnd: HWND) {
     let off: i32 = 0;
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &on as *const _ as *const _, 4);
 
-    dock_bottom_right(hwnd);
+    place_window(hwnd);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    // now that it is "shown" its DPI is known; re-dock in case that resized it
-    dock_bottom_right(hwnd);
+    // now that it is "shown" its DPI is known; re-place in case that resized it
+    place_window(hwnd);
     let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_ALLCHILDREN);
 
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &off as *const _ as *const _, 4);
@@ -512,6 +514,26 @@ unsafe fn toggle_window(hwnd: HWND) {
 
 /// Bottom-right of the work area of whichever monitor the cursor is on, so
 /// it sits above the taskbar and lands on the right screen in a multi-mon setup.
+/// Where the window should appear: the position the user dragged it to, if that
+/// is still on a monitor that exists, otherwise docked bottom-right.
+unsafe fn place_window(hwnd: HWND) {
+    let ui = get_ui(hwnd);
+    let saved = *ui.shared.window_pos.lock().unwrap();
+    if let Some((x, y)) = saved {
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        // a saved spot is only usable if a monitor still covers it - screens
+        // get unplugged and resolutions change between runs
+        let probe = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        if !MonitorFromRect(&probe, MONITOR_DEFAULTTONULL).is_invalid() {
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return;
+        }
+    }
+    dock_bottom_right(hwnd);
+}
+
 unsafe fn dock_bottom_right(hwnd: HWND) {
     let ui = get_ui(hwnd);
     let mut pt = POINT::default();
@@ -572,6 +594,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // uninitialised, which composites as a white flash on the first show.
         // Our own InvalidateRect calls pass bErase = false, so this does NOT
         // run on the repaint hot path — only when Windows asks for an erase.
+        // With no caption there is nothing to grab, so treat any part of the
+        // window that isn't the curve editor as the title bar. Child controls
+        // are separate windows and never see this, so buttons still work.
+        WM_NCHITTEST => {
+            let ui = get_ui(hwnd);
+            let mut pt = POINT { x: (lp.0 & 0xFFFF) as u16 as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let p = ui.lay.plot;
+            let slack = ui.s(10);
+            let in_plot = pt.x >= p.left - slack && pt.x <= p.right + slack
+                && pt.y >= p.top - slack && pt.y <= p.bottom + slack;
+            return LRESULT(if in_plot { HTCLIENT as isize } else { HTCAPTION as isize });
+        }
+        // a caption drag ends here; remember where it landed
+        WM_EXITSIZEMOVE => {
+            let ui = get_ui(hwnd);
+            let mut r = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut r);
+            *ui.shared.window_pos.lock().unwrap() = Some((r.left, r.top));
+            ui.shared.persist();
+        }
+        // no close button any more, so give Esc the obvious meaning
+        WM_KEYDOWN if wp.0 as u32 == VK_ESCAPE.0 as u32 => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        // double-clicking a caption normally maximises; there is nothing to
+        // maximise here and it would fight the docking
+        WM_NCLBUTTONDBLCLK => return LRESULT(0),
         WM_ERASEBKGND => {
             let ui = get_ui(hwnd);
             let mut rc = RECT::default();
@@ -990,6 +1040,15 @@ fn draw_shapes(ui: &Ui, hdc: HDC, rc: &RECT) {
         let l = ui.lay;
         let g = Gp::new(hdc, true);
         let rad = ui.s(8);
+
+        // There is no window frame any more, so draw our own hairline edge —
+        // without it the panel bleeds into whatever is behind it.
+        g.round_rect(
+            &RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom },
+            rad,
+            None,
+            Some(argb(0x3A4152, 255)),
+        );
 
         g.round_rect(&l.card, rad, Some(argb(col::CARD, 255)), Some(argb(col::BORDER, 255)));
         g.round_rect(&l.side, rad, Some(argb(col::CARD, 255)), Some(argb(col::BORDER, 255)));

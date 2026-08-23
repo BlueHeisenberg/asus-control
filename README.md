@@ -14,6 +14,23 @@ per-monitor-v2 DPI aware, dark title bar.
 - Extra sensors via LibreHardwareMonitor bridge: GPU temp/load, NVMe temps, RAM, CPU load
 - "Release all fans" restores firmware/BIOS control instantly
 
+## Window
+
+Borderless and tray-resident — there is no title bar and no min/max/close.
+
+- **Ctrl+Shift+F12** shows/hides it (configurable; see `hotkey` in the config).
+  Plain Shift+F12 is claimed by other software on a lot of machines, so the app
+  falls back through Win+F12 and Ctrl+Shift+F11 and tells you which it holds.
+- The tray icon toggles it too; its menu has Show/Hide and Exit. **Exit is the
+  only thing that really quits** — closing hides to tray, because the process
+  owns your fans for as long as it runs.
+- **Esc** hides it.
+- **Drag it from anywhere that isn't the curve editor** — the header, the
+  sensor list, the empty footer. Where you drop it is remembered in
+  `window_pos` and reused every time it opens. Delete that key (or move the
+  window to a monitor you later unplug) and it goes back to docking itself
+  bottom-right of whichever monitor the cursor is on.
+
 ## Run
 
 Requires administrator (driver load). Launch `deploy/asus-control.exe` and accept UAC.
