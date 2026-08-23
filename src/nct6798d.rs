@@ -1,12 +1,12 @@
 use crate::ring0;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 /// HWM base I/O address (from SuperIO LDN 0x0B config regs 0x60/0x61)
 pub struct Nct6798d {
     base: u16,
+    /// last bank we selected; invalidated on every lock acquire because
+    /// another process may have changed it while we were not holding the mutex
     current_bank: u8,
-    /// saved control-mode register values for restore
-    saved_mode: [u8; 7],
-    saved_pwm: [u8; 7],
 }
 
 // ---- Register map (from LibreHardwareMonitor Nct677X.cs, NCT6798D/NCT6799D) ----
@@ -61,10 +61,79 @@ const TEMPS: [TempSource; 10] = [
     TempSource { reg: 0x4A2, half_reg: 0x4A1, half_bit: 7, src_reg: 0xC00, src_id: 12, label: "TSENSOR" },
 ];
 
+/// The board's SuperIO is a shared index/data port pair: you write the register
+/// to ADDR then read/write DATA. That sequence is not atomic, and Armoury Crate,
+/// HWiNFO and LHM all drive the same chip. Every vendor tool arbitrates on this
+/// mutex; if we don't, another process lands its index between our two writes
+/// and we read — or worse, WRITE — a completely different register.
+const ISA_MUTEX_NAME: &str = r"Global\Access_ISABUS.HTP.Method";
+
+fn isa_mutex() -> windows::Win32::Foundation::HANDLE {
+    use std::sync::OnceLock;
+    use windows::Win32::System::Threading::CreateMutexW;
+    static H: OnceLock<usize> = OnceLock::new();
+    let raw = *H.get_or_init(|| unsafe {
+        let name: Vec<u16> = ISA_MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        CreateMutexW(None, false, windows::core::PCWSTR(name.as_ptr()))
+            .map(|h| h.0 as usize)
+            .unwrap_or(0)
+    });
+    windows::Win32::Foundation::HANDLE(raw as *mut _)
+}
+
+/// Held for the duration of one logical SuperIO transaction.
+struct IsaGuard(Option<windows::Win32::Foundation::HANDLE>);
+
+impl IsaGuard {
+    fn new() -> IsaGuard {
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        let h = isa_mutex();
+        if h.0 as usize == 0 {
+            return IsaGuard(None);
+        }
+        let r = unsafe { WaitForSingleObject(h, 200) };
+        // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80 (previous owner died holding it)
+        if r.0 == 0 || r.0 == 0x80 {
+            IsaGuard(Some(h))
+        } else {
+            // Timed out. Proceed unlocked rather than stall fan control, but we
+            // do NOT own the mutex so we must not release it.
+            IsaGuard(None)
+        }
+    }
+}
+
+impl Drop for IsaGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.0 {
+            unsafe {
+                let _ = windows::Win32::System::Threading::ReleaseMutex(h);
+            }
+        }
+    }
+}
+
+/// Mirror of each fan's pre-takeover BIOS state, kept in statics rather than in
+/// Nct6798d so ANY thread — including a panic hook, after the worker is gone —
+/// can hand the fans back to firmware. 0xFFFF means "we never touched this fan".
+const UNSAVED: u16 = 0xFFFF;
+static SAVED_MODE: [AtomicU16; 7] = [const { AtomicU16::new(UNSAVED) }; 7];
+static SAVED_PWM: [AtomicU16; 7] = [const { AtomicU16::new(UNSAVED) }; 7];
+
+/// Give every fan we took over back to the firmware. Safe to call from a panic
+/// hook or at exit: it re-detects the chip instead of needing the worker's copy.
+pub fn emergency_restore() {
+    let Some(mut n) = Nct6798d::detect() else { return };
+    for i in 0..7 {
+        n.restore_fan(i);
+    }
+}
+
 impl Nct6798d {
     /// Detect the chip. Returns None if no NCT6798D/6799D found.
     pub fn detect() -> Option<Nct6798d> {
         let r0 = ring0::get().ok()?;
+        let _isa = IsaGuard::new();
         // Try standard SuperIO ports
         for sio_port in [0x2Eu16, 0x4Eu16] {
             // Enter config mode
@@ -117,12 +186,7 @@ impl Nct6798d {
                 continue;
             }
 
-            return Some(Nct6798d {
-                base,
-                current_bank: 0xFF,
-                saved_mode: [0; 7],
-                saved_pwm: [0; 7],
-            });
+            return Some(Nct6798d { base, current_bank: 0xFF });
         }
         None
     }
@@ -166,6 +230,8 @@ impl Nct6798d {
 
     /// Read temperatures in degrees Celsius.
     pub fn read_temps(&mut self) -> Vec<(String, f32)> {
+        let _isa = IsaGuard::new();
+        self.current_bank = 0xFF;
         let mut out = Vec::new();
         for ts in TEMPS.iter() {
             let raw = self.read_byte(ts.reg) as i8;
@@ -184,6 +250,8 @@ impl Nct6798d {
 
     /// Read fan RPMs.
     pub fn read_fans(&mut self) -> Vec<Option<f32>> {
+        let _isa = IsaGuard::new();
+        self.current_bank = 0xFF;
         let mut out = Vec::with_capacity(7);
         for reg in FAN_COUNT_REG.iter() {
             let high = self.read_byte(*reg) as u16;
@@ -220,6 +288,8 @@ impl Nct6798d {
 
     /// Read current PWM duty (0-100%) per fan.
     pub fn read_pwm(&mut self) -> Vec<Option<f32>> {
+        let _isa = IsaGuard::new();
+        self.current_bank = 0xFF;
         let mut out = Vec::with_capacity(7);
         for reg in FAN_PWM_OUT_REG.iter() {
             let v = self.read_byte(*reg);
@@ -233,11 +303,18 @@ impl Nct6798d {
         if index >= 7 {
             return;
         }
+        let _isa = IsaGuard::new();
+        self.current_bank = 0xFF;
         let duty = ((percent.clamp(0.0, 100.0) / 100.0) * 255.0).round() as u8;
-        // Save defaults on first touch
-        if self.saved_mode[index] == 0 {
-            self.saved_mode[index] = self.read_byte(FAN_CONTROL_MODE_REG[index]);
-            self.saved_pwm[index] = self.read_byte(FAN_PWM_COMMAND_REG[index]);
+        // Save the firmware's settings the first time we touch this fan.
+        // NB: mode 0 is a LEGAL value, so "is it saved" needs its own sentinel —
+        // using 0 meant restore silently did nothing and the saved PWM got
+        // overwritten with our own duty on every tick.
+        if SAVED_MODE[index].load(Ordering::Relaxed) == UNSAVED {
+            let m = self.read_byte(FAN_CONTROL_MODE_REG[index]) as u16;
+            let p = self.read_byte(FAN_PWM_COMMAND_REG[index]) as u16;
+            SAVED_MODE[index].store(m, Ordering::Relaxed);
+            SAVED_PWM[index].store(p, Ordering::Relaxed);
         }
         // Manual mode
         self.write_byte(FAN_CONTROL_MODE_REG[index], 0);
@@ -250,11 +327,14 @@ impl Nct6798d {
         if index >= 7 {
             return;
         }
-        if self.saved_mode[index] != 0 {
-            self.write_byte(FAN_CONTROL_MODE_REG[index], self.saved_mode[index]);
-            self.write_byte(FAN_PWM_COMMAND_REG[index], self.saved_pwm[index]);
-            self.saved_mode[index] = 0;
-            self.saved_pwm[index] = 0;
+        let mode = SAVED_MODE[index].load(Ordering::Relaxed);
+        if mode != UNSAVED {
+            let _isa = IsaGuard::new();
+            self.current_bank = 0xFF;
+            self.write_byte(FAN_CONTROL_MODE_REG[index], mode as u8);
+            self.write_byte(FAN_PWM_COMMAND_REG[index], SAVED_PWM[index].load(Ordering::Relaxed) as u8);
+            SAVED_MODE[index].store(UNSAVED, Ordering::Relaxed);
+            SAVED_PWM[index].store(UNSAVED, Ordering::Relaxed);
         }
     }
 

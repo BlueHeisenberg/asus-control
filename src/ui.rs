@@ -28,6 +28,7 @@ const ID_PRESET_DEFAULT: isize = 211;
 const ID_PRESET_QUIET: isize = 212;
 const ID_PRESET_FULL: isize = 213;
 const ID_RELEASE_ALL: isize = 214;
+const ID_ASUS_SVC: isize = 215;
 const ID_TICK: isize = 220;
 
 const TEMP_MIN: f32 = 20.0;
@@ -50,6 +51,12 @@ mod col {
     pub const HOT: u32 = 0xF85149;
     pub const DANGER: u32 = 0xE5534B;
     pub const DANGER_BG: u32 = 0x2C1A1B;
+    pub const WARN_BG: u32 = 0x2A2412;
+    pub const WARN_BR: u32 = 0x6B551F;
+    pub const WARN_FG: u32 = 0xE8C46A;
+    pub const OK_BG: u32 = 0x14301A;
+    pub const OK_BR: u32 = 0x2F6B36;
+    pub const OK_FG: u32 = 0x7EE08C;
 }
 
 /// Win32 COLORREF is 0x00BBGGRR — take a normal 0xRRGGBB literal and swap.
@@ -88,6 +95,7 @@ struct Ui {
     font_mono: HFONT,
     brush_bg: HBRUSH,
     last_sig: u64,
+    asus_state: bool,
 }
 
 impl Ui {
@@ -166,6 +174,7 @@ pub fn run(shared: Arc<Shared>) {
             font_mono: HFONT::default(),
             brush_bg: CreateSolidBrush(rgb(col::BG)),
             last_sig: 0,
+            asus_state: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ui) as _);
         make_fonts(get_ui(hwnd));
@@ -187,6 +196,7 @@ pub fn run(shared: Arc<Shared>) {
         create_child(hwnd, hinstance, "BUTTON", "Quiet", BS_OWNERDRAW as u32, ID_PRESET_QUIET);
         create_child(hwnd, hinstance, "BUTTON", "Full Speed", BS_OWNERDRAW as u32, ID_PRESET_FULL);
         create_child(hwnd, hinstance, "BUTTON", "Release all fans", BS_OWNERDRAW as u32, ID_RELEASE_ALL);
+        create_child(hwnd, hinstance, "BUTTON", "", BS_OWNERDRAW as u32, ID_ASUS_SVC);
 
         let track = create_child(hwnd, hinstance, "msctls_trackbar32", "", TBS_HORZ | TBS_NOTICKS, ID_TICK);
         SendMessageW(track, TBM_SETRANGE, WPARAM(1), LPARAM((((2000u32) << 16) | 100u32) as i32 as isize));
@@ -327,7 +337,8 @@ fn relayout(hwnd: HWND) {
         // footer
         let fh = s(32);
         let fy = l.footer.top + (l.footer.bottom - l.footer.top - fh) / 2;
-        mv(ID_RELEASE_ALL, l.footer.left, fy, s(190), fh);
+        mv(ID_RELEASE_ALL, l.footer.left, fy, s(180), fh);
+        mv(ID_ASUS_SVC, l.footer.left + s(188), fy, s(220), fh);
         mv(ID_TICK, l.footer.right - s(210), fy, s(210), fh);
 
         let _ = InvalidateRect(hwnd, None, false);
@@ -377,6 +388,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             let ui = get_ui(hwnd);
+            let asus = ui.shared.asus_disabled();
+            if asus != ui.asus_state {
+                ui.asus_state = asus;
+                if let Some(b) = dlg(hwnd, ID_ASUS_SVC) {
+                    let _ = InvalidateRect(b, None, false);
+                }
+            }
             let sig = data_signature(ui);
             if sig != ui.last_sig {
                 ui.last_sig = sig;
@@ -472,6 +490,13 @@ fn handle_command(hwnd: HWND, wp: WPARAM) {
             ID_PRESET_QUIET => set_preset(ui, vec![(30., 15.), (60., 25.), (75., 45.), (90., 85.)]),
             ID_PRESET_FULL => set_preset(ui, vec![(20., 100.), (110., 100.)]),
             ID_RELEASE_ALL => ui.shared.release_all.store(true, Ordering::Relaxed),
+            ID_ASUS_SVC => {
+                ui.shared.toggle_asus.store(true, Ordering::Relaxed);
+                *ui.shared.status.lock().unwrap() = "working on ASUS services…".into();
+                if let Some(b) = dlg(hwnd, ID_ASUS_SVC) {
+                    let _ = InvalidateRect(b, None, false);
+                }
+            }
             _ => {}
         }
         let _ = InvalidateRect(hwnd, None, false);
@@ -1061,7 +1086,16 @@ unsafe fn draw_owner_button_inner(dis: &DRAWITEMSTRUCT, ui: &Ui) {
     let selected_tab = is_tab && id == ID_FAN_BASE + ui.selected as isize;
     let controlled = is_tab && ui.shared.fans.lock().unwrap()[(id - ID_FAN_BASE) as usize].enabled;
 
-    let (fill, border, fg) = if id == ID_RELEASE_ALL {
+    let asus_off = id == ID_ASUS_SVC && ui.shared.asus_disabled();
+    let (fill, border, fg) = if id == ID_ASUS_SVC {
+        if asus_off {
+            if hot { (0x1B3E22, col::OK_BR, 0x9BEBA6) } else { (col::OK_BG, col::OK_BR, col::OK_FG) }
+        } else if hot {
+            (0x372F17, col::WARN_BR, 0xF2D488)
+        } else {
+            (col::WARN_BG, col::WARN_BR, col::WARN_FG)
+        }
+    } else if id == ID_RELEASE_ALL {
         if pressed {
             (col::DANGER, col::DANGER, 0xFFFFFF)
         } else if hot {
@@ -1087,9 +1121,13 @@ unsafe fn draw_owner_button_inner(dis: &DRAWITEMSTRUCT, ui: &Ui) {
     }
     drop(g);
 
-    let mut buf = [0u16; 64];
-    let len = GetWindowTextW(dis.hwndItem, &mut buf);
-    let s: String = String::from_utf16_lossy(&buf[..len as usize]);
+    let s: String = if id == ID_ASUS_SVC {
+        if asus_off { "Restore ASUS services".into() } else { "Disable ASUS services".into() }
+    } else {
+        let mut buf = [0u16; 64];
+        let len = GetWindowTextW(dis.hwndItem, &mut buf);
+        String::from_utf16_lossy(&buf[..len as usize])
+    };
     txt(hdc, &s, rc, DT_CENTER | DT_VCENTER, if selected_tab { ui.font_bold } else { ui.font }, fg);
 }
 

@@ -13,6 +13,11 @@ pub struct FanConfig {
 pub struct Config {
     pub fans: Vec<FanConfig>,
     pub tick_ms: u32,
+    /// (service name, previous start type) for ASUS services we disabled.
+    /// Empty means we have not disabled anything. This is the only way back,
+    /// so it lives in the config file rather than in memory.
+    #[serde(default)]
+    pub asus_backup: Vec<(String, u32)>,
 }
 
 impl Default for Config {
@@ -20,6 +25,7 @@ impl Default for Config {
         Config {
             fans: default_fans(),
             tick_ms: 500,
+            asus_backup: Vec::new(),
         }
     }
 }
@@ -74,10 +80,11 @@ pub fn exists() -> bool {
     config_path().exists()
 }
 
-pub fn save(fans: &[FanConfig], tick_ms: u32) {
+pub fn save(fans: &[FanConfig], tick_ms: u32, asus_backup: &[(String, u32)]) {
     let cfg = Config {
         fans: fans.to_vec(),
         tick_ms,
+        asus_backup: asus_backup.to_vec(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&cfg) {
         let _ = std::fs::write(config_path(), json);

@@ -19,6 +19,9 @@ pub struct SensorData {
 pub struct Shared {
     pub data: Mutex<SensorData>,
     pub fans: Mutex<Vec<FanConfig>>,
+    /// set by the UI, actioned on the worker thread (service calls block)
+    pub toggle_asus: AtomicBool,
+    pub asus_backup: Mutex<Vec<(String, u32)>>,
     pub restore_mask: AtomicU64,
     pub release_all: AtomicBool,
     pub tick_ms: AtomicU32,
@@ -31,13 +34,15 @@ impl Shared {
         let mut cfg = config::load();
         // Create the config file on first run so users can find/edit it
         if !config::exists() {
-            config::save(&cfg.fans, cfg.tick_ms);
+            config::save(&cfg.fans, cfg.tick_ms, &cfg.asus_backup);
         }
         let _ = &mut cfg;
         let tick = cfg.tick_ms;
         Arc::new(Shared {
             data: Mutex::new(SensorData::default()),
             fans: Mutex::new(cfg.fans),
+            toggle_asus: AtomicBool::new(false),
+            asus_backup: Mutex::new(cfg.asus_backup),
             restore_mask: AtomicU64::new(0),
             release_all: AtomicBool::new(false),
             tick_ms: AtomicU32::new(tick),
@@ -48,7 +53,13 @@ impl Shared {
 
     pub fn persist(&self) {
         let fans = self.fans.lock().unwrap().clone();
-        config::save(&fans, self.tick_ms.load(Ordering::Relaxed));
+        let backup = self.asus_backup.lock().unwrap().clone();
+        config::save(&fans, self.tick_ms.load(Ordering::Relaxed), &backup);
+    }
+
+    /// True when we currently hold ASUS services disabled.
+    pub fn asus_disabled(&self) -> bool {
+        !self.asus_backup.lock().unwrap().is_empty()
     }
 
     /// CPU temperature used as the default control source.
@@ -118,6 +129,27 @@ fn worker_loop(shared: Arc<Shared>) {
             }
             shared.persist();
         }
+        // Stopping services blocks for seconds per service. Doing that inline
+        // froze the poll loop, so nothing refreshed the fans while the ASUS
+        // stack was tearing down — run it on its own thread.
+        if shared.toggle_asus.swap(false, Ordering::Relaxed) {
+            let sh = shared.clone();
+            std::thread::spawn(move || {
+                let held = sh.asus_backup.lock().unwrap().clone();
+                let msg = if held.is_empty() {
+                    let (backup, msg) = crate::services::disable_all();
+                    *sh.asus_backup.lock().unwrap() = backup;
+                    msg
+                } else {
+                    let msg = crate::services::restore(&held);
+                    sh.asus_backup.lock().unwrap().clear();
+                    msg
+                };
+                *sh.status.lock().unwrap() = msg;
+                sh.persist();
+            });
+        }
+
         let mask = shared.restore_mask.swap(0, Ordering::Relaxed);
         if mask != 0 {
             if let Some(n) = nct.as_mut() {

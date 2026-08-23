@@ -4,6 +4,7 @@ mod config;
 mod nct6798d;
 mod ring0;
 mod sensors;
+mod services;
 mod ui;
 mod worker;
 
@@ -17,9 +18,21 @@ fn main() {
         return;
     }
 
+    // Dying while we hold the fans leaves them frozen at the last duty we wrote,
+    // with no curve to raise them as the CPU heats. `panic = "abort"` means no
+    // unwinding and no Drop, so this hook is the only chance to hand them back.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        nct6798d::emergency_restore();
+        prev(info);
+    }));
+
     let shared = worker::Shared::new();
     worker::spawn_worker(shared.clone());
     ui::run(shared);
+
+    // normal exit: never leave the board under stale software control
+    nct6798d::emergency_restore();
 }
 
 fn check() {
