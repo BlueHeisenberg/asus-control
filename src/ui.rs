@@ -153,6 +153,10 @@ pub fn run(shared: Arc<Shared>) {
             lpfnWndProc: Some(wndproc),
             hInstance: him,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            // Without this the class background is null, so the surface DWM
+            // composites before our first WM_PAINT is uninitialised and shows
+            // as a white flash every time the window is un-hidden.
+            hbrBackground: CreateSolidBrush(rgb(col::BG)),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
@@ -261,6 +265,7 @@ pub fn run(shared: Arc<Shared>) {
         }
         tray(hwnd, NIM_ADD);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
         // Dock AFTER showing: before the first show the frame has not settled to
         // its final size, so GetWindowRect returns a stale extent and the window
         // lands short of the corner.
@@ -478,8 +483,11 @@ unsafe fn toggle_window(hwnd: HWND) {
         // has settled and is what actually lands it in the corner.
         dock_bottom_right(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
         dock_bottom_right(hwnd);
+        // force the first frame now; without it the window is composited once
+        // before WM_PAINT ever runs
+        let _ = UpdateWindow(hwnd);
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 
@@ -541,7 +549,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = ShowWindow(hwnd, SW_HIDE);
             return LRESULT(0);
         }
-        WM_ERASEBKGND => return LRESULT(1),
+        // Claiming the erase without doing one leaves the client area
+        // uninitialised, which composites as a white flash on the first show.
+        // Our own InvalidateRect calls pass bErase = false, so this does NOT
+        // run on the repaint hot path — only when Windows asks for an erase.
+        WM_ERASEBKGND => {
+            let ui = get_ui(hwnd);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            FillRect(HDC(wp.0 as *mut _), &rc, ui.brush_bg);
+            return LRESULT(1);
+        }
         WM_PAINT => paint(hwnd),
         WM_SIZE => relayout(hwnd),
         WM_GETMINMAXINFO => {
